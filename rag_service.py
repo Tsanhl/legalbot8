@@ -647,7 +647,10 @@ class RAGService:
                 built via migrate_to_bge_embeddings().
         """
         if persist_directory is None:
-            persist_directory = os.path.join(os.path.dirname(__file__), 'chroma_db')
+            persist_directory = (
+                os.getenv("RAG_PERSIST_DIRECTORY")
+                or os.path.join(os.path.dirname(__file__), 'chroma_db')
+            )
 
         self.persist_directory = persist_directory
         self.use_upgraded_embeddings = use_upgraded_embeddings

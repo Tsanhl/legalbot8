@@ -25,6 +25,7 @@ To make RAG retrieval available on Render without committing `chroma_db`, the ap
 download your index from Hugging Face on startup.
 
 Set these environment variables in Render:
+- `RAG_PERSIST_DIRECTORY=/var/data/chroma_db` (recommended if using Render Disk)
 - `RAG_HF_BOOTSTRAP=1`
 - `RAG_HF_REPO_ID=Agnes999/legalbot8`
 - `RAG_HF_REPO_TYPE=dataset`
