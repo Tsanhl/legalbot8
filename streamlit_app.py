@@ -760,10 +760,6 @@ def _strengthen_short_essay_conclusion(
     if (not _has_visible_conclusion(out)) or _needs_forced_part_conclusion(out):
         out = _inject_brief_conclusion_tail(out, max_words=max_words, prompt_text=prompt_text)
 
-    current_conclusion_words = _conclusion_section_word_count(out)
-    if current_conclusion_words >= min_conclusion_words:
-        return out
-
     body = re.sub(r"\(End of Answer\)\s*$", "", out, flags=re.IGNORECASE).strip()
     body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
     if not body:
@@ -782,16 +778,44 @@ def _strengthen_short_essay_conclusion(
     heading_line = last_match.group(0).strip()
     advice_mode = bool(re.search(r"(?i)\badvice\b", heading_line))
     lead_body = body[:last_match.start()].strip()
+    existing_conclusion = body[last_match.end():].strip()
+
+    # If conclusion is already substantial, keep as-is.
+    if _count_words(existing_conclusion) >= min_conclusion_words:
+        return out
+
     supplement = _build_contextual_conclusion_paragraph(
         lead_body,
         prompt_text,
         advice_mode=advice_mode,
     )
+    rebuilt_conclusion = existing_conclusion
+    if rebuilt_conclusion:
+        rebuilt_conclusion += "\n\n"
+    rebuilt_conclusion += supplement
 
-    body += "\n\n" + supplement
+    # Ensure the conclusion itself is not too short.
+    if _count_words(rebuilt_conclusion) < min_conclusion_words:
+        rebuilt_conclusion += (
+            "\n\nAccordingly, the strongest final answer states the preferred outcome clearly, "
+            "acknowledges the most serious counter-position, and explains why that counter-position fails."
+        )
+
+    # Rebuild with space reservation for conclusion quality under strict word caps.
+    rebuilt = f"{lead_body}\n\n{heading_line}\n\n{rebuilt_conclusion}".strip()
     if max_words and max_words > 0:
-        body = _truncate_to_word_cap(body, max_words, max(1, int(max_words * 0.90)))
-    return body.strip()
+        heading_words = max(1, _count_words(heading_line))
+        conclusion_words = max(1, _count_words(rebuilt_conclusion))
+        reserve_for_conclusion = heading_words + conclusion_words
+        available_for_lead = max(1, max_words - reserve_for_conclusion)
+        trimmed_lead = _truncate_to_word_cap(
+            lead_body,
+            available_for_lead,
+            max(1, int(available_for_lead * 0.85))
+        )
+        rebuilt = f"{trimmed_lead}\n\n{heading_line}\n\n{rebuilt_conclusion}".strip()
+        rebuilt = _truncate_to_word_cap(rebuilt, max_words, max(1, int(max_words * 0.90)))
+    return rebuilt.strip()
 
 def _resolve_word_window_from_history(prompt_text: str, messages: List[Dict[str, Any]]) -> Optional[tuple]:
     """
@@ -2783,6 +2807,11 @@ def main():
                         r'\2',
                         final_response,
                     )
+                    # Remove malformed residual parenthetical initials after citation sanitization
+                    # (e.g., "(J)", "(J )", "(X.)"), which are never valid legal citations.
+                    final_response = re.sub(r'\s*\(\s*[A-Z](?:\.)?\s*\)', '', final_response)
+                    # Clean stray lead-in where a malformed parenthetical was removed.
+                    final_response = re.sub(r'(?i)\b(as\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?\s+notes),\s*[.;]', r'\1.', final_response)
                     # Triple+ newlines
                     final_response = re.sub(r"\n{3,}", "\n\n", final_response).strip()
                     final_response = _restore_paragraph_separation(final_response)
