@@ -596,7 +596,119 @@ def _truncate_restarted_part_i(text: str) -> str:
         t = t[:matches[1].start()].rstrip()
     return t
 
-def _inject_brief_conclusion_tail(answer_text: str, max_words: Optional[int] = None) -> str:
+def _collect_authority_tokens(text: str, limit: int = 4) -> Dict[str, List[str]]:
+    """
+    Extract a small set of statute/case tokens already present in the draft,
+    so fallback conclusion text stays grounded in existing material.
+    """
+    body = (text or "")
+    acts: List[str] = []
+    cases: List[str] = []
+    seen_act = set()
+    seen_case = set()
+
+    for m in re.finditer(r"\b([A-Z][A-Za-z0-9&',()\- ]+ Act \d{4})\b", body):
+        s = m.group(1).strip()
+        key = s.lower()
+        if key in seen_act:
+            continue
+        seen_act.add(key)
+        acts.append(s)
+        if len(acts) >= limit:
+            break
+
+    for m in re.finditer(r"\b([A-Z][A-Za-z0-9&',.\- ]+ v [A-Z][A-Za-z0-9&',.\- ]+)\b", body):
+        s = re.sub(r"\s+", " ", m.group(1)).strip()
+        key = s.lower()
+        if key in seen_case:
+            continue
+        seen_case.add(key)
+        cases.append(s)
+        if len(cases) >= limit:
+            break
+
+    return {"acts": acts, "cases": cases}
+
+def _build_contextual_conclusion_paragraph(
+    body: str,
+    prompt_text: str = "",
+    *,
+    advice_mode: bool = False
+) -> str:
+    """
+    Build a grounded fallback conclusion paragraph without hard-coded topic content.
+    """
+    auth = _collect_authority_tokens(body, limit=3)
+    acts = auth.get("acts", [])
+    cases = auth.get("cases", [])
+
+    authority_line = ""
+    if acts and cases:
+        authority_line = (
+            f"That conclusion is reinforced by the statutory framework ({'; '.join(acts[:2])}) "
+            f"and the leading authorities ({'; '.join(cases[:2])})."
+        )
+    elif acts:
+        authority_line = (
+            f"That conclusion is reinforced by the statutory framework ({'; '.join(acts[:2])}) "
+            "and its purposive application to the facts."
+        )
+    elif cases:
+        authority_line = (
+            f"That conclusion is reinforced by the leading authorities ({'; '.join(cases[:2])}) "
+            "and the way they constrain the available outcomes."
+        )
+    else:
+        authority_line = (
+            "That conclusion should be defended by tying the governing legal framework to the "
+            "strongest and weakest factual inferences in the record."
+        )
+
+    if advice_mode:
+        closing_line = (
+            "Practically, the strongest advice is to state the likely outcome, identify the principal "
+            "litigation and evidential risks, and explain what additional facts would alter that result."
+        )
+    else:
+        closing_line = (
+            "The highest-quality answer therefore resolves competing arguments explicitly, justifies the "
+            "preferred interpretation on text, principle, and policy, and addresses the best counter-argument."
+        )
+
+    return (
+        "On balance, the stronger position is the one that synthesizes doctrine, authority, "
+        "and policy into a single coherent analysis rather than treating each source in isolation. "
+        + authority_line
+        + " "
+        + closing_line
+    )
+
+def _conclusion_section_word_count(answer_text: str) -> int:
+    """
+    Return words in the trailing conclusion/advice section body (excluding heading).
+    """
+    text = (answer_text or "").strip()
+    if not text:
+        return 0
+    body = re.sub(r"\(End of Answer\)\s*$", "", text, flags=re.IGNORECASE).strip()
+    body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
+    matches = list(
+        re.finditer(
+            r"(?im)^\s*(?:Part\s+[IVXLC]+\s*:\s*)?(?:Conclusion(?:\s+and\s+Advice)?|Advice(?:\s+and\s+Conclusion)?|Final\s+Advice)\s*$",
+            body,
+        )
+    )
+    if not matches:
+        return 0
+    start = matches[-1].end()
+    section = body[start:].strip()
+    return _count_words(section)
+
+def _inject_brief_conclusion_tail(
+    answer_text: str,
+    max_words: Optional[int] = None,
+    prompt_text: str = "",
+) -> str:
     """
     Ensure a final explicit conclusion block exists, while respecting an optional
     single-response word cap.
@@ -608,11 +720,13 @@ def _inject_brief_conclusion_tail(answer_text: str, max_words: Optional[int] = N
     body = re.sub(r"\(End of Answer\)\s*$", "", text, flags=re.IGNORECASE).strip()
     body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
     heading = _next_part_conclusion_heading(body)
-    conclusion = (
-        f"{heading}\n\n"
-        "On balance, occupier liability turns on reasonable safety, obvious risk, and claimant autonomy; "
-        "the likely outcome depends on those factors and the available evidence."
+    advice_mode = bool(re.search(r"(?i)\badvice\b", heading))
+    conclusion_para = _build_contextual_conclusion_paragraph(
+        body,
+        prompt_text,
+        advice_mode=advice_mode,
     )
+    conclusion = f"{heading}\n\n{conclusion_para}"
 
     if max_words and max_words > 0:
         conc_words = max(1, _count_words(conclusion))
@@ -628,6 +742,56 @@ def _inject_brief_conclusion_tail(answer_text: str, max_words: Optional[int] = N
         out += "\n\n"
     out += conclusion
     return out.strip()
+
+def _strengthen_short_essay_conclusion(
+    answer_text: str,
+    prompt_text: str = "",
+    max_words: Optional[int] = None,
+    min_conclusion_words: int = 90,
+) -> str:
+    """
+    For short single-essay outputs, ensure the conclusion exists and has enough substance.
+    """
+    text = (answer_text or "").strip()
+    if not text:
+        return text
+
+    out = text
+    if (not _has_visible_conclusion(out)) or _needs_forced_part_conclusion(out):
+        out = _inject_brief_conclusion_tail(out, max_words=max_words, prompt_text=prompt_text)
+
+    current_conclusion_words = _conclusion_section_word_count(out)
+    if current_conclusion_words >= min_conclusion_words:
+        return out
+
+    body = re.sub(r"\(End of Answer\)\s*$", "", out, flags=re.IGNORECASE).strip()
+    body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
+    if not body:
+        return out
+
+    conclusion_matches = list(
+        re.finditer(
+            r"(?im)^\s*(?:Part\s+[IVXLC]+\s*:\s*)?(?:Conclusion(?:\s+and\s+Advice)?|Advice(?:\s+and\s+Conclusion)?|Final\s+Advice)\s*$",
+            body,
+        )
+    )
+    if not conclusion_matches:
+        return out
+
+    last_match = conclusion_matches[-1]
+    heading_line = last_match.group(0).strip()
+    advice_mode = bool(re.search(r"(?i)\badvice\b", heading_line))
+    lead_body = body[:last_match.start()].strip()
+    supplement = _build_contextual_conclusion_paragraph(
+        lead_body,
+        prompt_text,
+        advice_mode=advice_mode,
+    )
+
+    body += "\n\n" + supplement
+    if max_words and max_words > 0:
+        body = _truncate_to_word_cap(body, max_words, max(1, int(max_words * 0.90)))
+    return body.strip()
 
 def _resolve_word_window_from_history(prompt_text: str, messages: List[Dict[str, Any]]) -> Optional[tuple]:
     """
@@ -2648,7 +2812,8 @@ def main():
                     ):
                         final_response = _inject_brief_conclusion_tail(
                             final_response,
-                            max_words=single_target_words
+                            max_words=single_target_words,
+                            prompt_text=prompt_for_model,
                         )
                         if single_target_words:
                             final_response = _truncate_to_word_cap(
@@ -2656,6 +2821,15 @@ def main():
                                 single_target_words,
                                 max(1, int(single_target_words * 0.90))
                             )
+
+                    # For short single-essay requests, ensure the conclusion is substantive.
+                    if (not is_intermediate_part) and is_short_single_essay:
+                        final_response = _strengthen_short_essay_conclusion(
+                            final_response,
+                            prompt_text=prompt_for_model,
+                            max_words=single_target_words,
+                            min_conclusion_words=90,
+                        )
 
                     # Final hardening: clean any leaked debug artefacts and enforce the
                     # correct part ending marker (intermediate vs final) from history.
