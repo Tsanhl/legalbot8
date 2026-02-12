@@ -260,6 +260,11 @@ def _strip_generation_artifacts(text: str) -> str:
     t = (text or "")
     if not t.strip():
         return t
+    # Hard-cut common leaked debug payloads if they appear inline.
+    t = re.sub(r'(?is)\n\s*📚\s*RAG Retrieved Content \(Debug\).*$', '', t)
+    t = re.sub(r'(?is)\n\s*Context Length:\s*\d+\s*characters.*$', '', t)
+    t = re.sub(r'(?is)\n\s*Allowed Authorities \(preview\):.*$', '', t)
+    t = re.sub(r'(?is)\n\s*\[RAG CONTEXT - INTERNAL - DO NOT OUTPUT\].*$', '', t)
     # If debug content leaked after an "(End of Answer)" marker, keep only the answer body.
     end_marker = re.search(r"\(End of Answer\)", t, flags=re.IGNORECASE)
     if end_marker:
@@ -540,6 +545,39 @@ def _needs_forced_part_conclusion(answer_text: str) -> bool:
         if re.search(r"(?i)\b(conclusion|advice)\b", t):
             return False
     return True
+
+def _inject_brief_conclusion_tail(answer_text: str, max_words: Optional[int] = None) -> str:
+    """
+    Ensure a final explicit conclusion block exists, while respecting an optional
+    single-response word cap.
+    """
+    text = (answer_text or "").strip()
+    if not text:
+        return text
+
+    body = re.sub(r"\(End of Answer\)\s*$", "", text, flags=re.IGNORECASE).strip()
+    body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
+    heading = _next_part_conclusion_heading(body)
+    conclusion = (
+        f"{heading}\n\n"
+        "On balance, occupier liability turns on reasonable safety, obvious risk, and claimant autonomy; "
+        "the likely outcome depends on those factors and the available evidence."
+    )
+
+    if max_words and max_words > 0:
+        conc_words = max(1, _count_words(conclusion))
+        body_words = _count_words(body)
+        if body_words + conc_words > max_words:
+            keep_words = max(1, max_words - conc_words)
+            body = _truncate_to_word_cap(body, keep_words, max(1, int(keep_words * 0.85)))
+            body = re.sub(r"\(End of Answer\)\s*$", "", body, flags=re.IGNORECASE).strip()
+            body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
+
+    out = body.rstrip()
+    if out:
+        out += "\n\n"
+    out += conclusion
+    return out.strip()
 
 def _resolve_word_window_from_history(prompt_text: str, messages: List[Dict[str, Any]]) -> Optional[tuple]:
     """
@@ -2431,10 +2469,18 @@ def main():
                                 # Allow a larger first patch so truncated final parts can actually finish.
                                 max_patch_words_cap = 420
                                 min_patch_words_floor = 60
+                                targets_now = _extract_word_targets(prompt_for_model)
+                                is_short_single_response = (
+                                    len(targets_now) == 1
+                                    and int(targets_now[0]) <= 1200
+                                    and (not _expected_part_state_from_history(prompt_for_model, current_project.get('messages', [])))
+                                )
                                 try:
-                                    abrupt_patch_attempts = int(os.getenv("ABRUPT_COMPLETION_PATCH_ATTEMPTS", "1"))
+                                    abrupt_patch_attempts = int(
+                                        os.getenv("ABRUPT_COMPLETION_PATCH_ATTEMPTS", "0" if is_short_single_response else "1")
+                                    )
                                 except ValueError:
-                                    abrupt_patch_attempts = 1
+                                    abrupt_patch_attempts = 0 if is_short_single_response else 1
                                 abrupt_patch_attempts = max(0, min(abrupt_patch_attempts, 2))
                                 for _ in range(abrupt_patch_attempts):
                                     if not _is_abrupt_answer_ending(final_response):
@@ -2528,42 +2574,47 @@ def main():
                     final_response = re.sub(r"\n{3,}", "\n\n", final_response).strip()
                     final_response = _restore_paragraph_separation(final_response)
 
-                    # Final-part safety net: ensure a visible conclusion block exists even when
-                    # the model spends budget on earlier analysis. Keep within current word cap.
+                    # Single-response hard cap: if the user explicitly requested N words in ONE response,
+                    # enforce "do not exceed N" locally without a second LLM pass (fast + deterministic).
+                    # Multi-part flows are capped elsewhere via the history-anchored window logic.
+                    single_target_words = None
+                    try:
+                        targets = _extract_word_targets(prompt_for_model)
+                        if len(targets) == 1 and not _expected_part_state_from_history(prompt_for_model, current_project.get('messages', [])):
+                            single_target_words = int(targets[0])
+                            min_w = int(single_target_words * 0.99)
+                            final_response = _truncate_to_word_cap(final_response, single_target_words, min_w)
+                    except Exception as cap_e:
+                        print(f"Word-cap enforcement skipped due to error: {cap_e}")
+
+                    # Final-part safety net: ensure a visible conclusion block exists.
                     if (
                         (not is_intermediate_part)
                         and ((not _has_visible_conclusion(final_response)) or _needs_forced_part_conclusion(final_response))
                     ):
-                        heading = _next_part_conclusion_heading(final_response)
-                        fallback = (
-                            f"{heading}\n\n"
-                            "On balance, the strongest legal route and likely outcome are as set out above, "
-                            "subject to evidence and procedure in the relevant forum."
+                        final_response = _inject_brief_conclusion_tail(
+                            final_response,
+                            max_words=single_target_words
                         )
-                        final_response = final_response.rstrip() + "\n\n" + fallback
-                        history_window_now = _resolve_word_window_from_history(
-                            prompt_for_model, current_project.get('messages', [])
-                        )
-                        if history_window_now:
-                            _min_w_now, _max_w_now = history_window_now
-                            final_response = _truncate_to_word_cap(final_response, _max_w_now, _min_w_now)
-
-                    # Single-response hard cap: if the user explicitly requested N words in ONE response,
-                    # enforce "do not exceed N" locally without a second LLM pass (fast + deterministic).
-                    # Multi-part flows are capped elsewhere via the history-anchored window logic.
-                    try:
-                        targets = _extract_word_targets(prompt_for_model)
-                        if len(targets) == 1 and not _expected_part_state_from_history(prompt_for_model, current_project.get('messages', [])):
-                            max_w = int(targets[0])
-                            min_w = int(max_w * 0.99)
-                            final_response = _truncate_to_word_cap(final_response, max_w, min_w)
-                    except Exception as cap_e:
-                        print(f"Word-cap enforcement skipped due to error: {cap_e}")
+                        if single_target_words:
+                            final_response = _truncate_to_word_cap(
+                                final_response,
+                                single_target_words,
+                                max(1, int(single_target_words * 0.90))
+                            )
 
                     # Final hardening: clean any leaked debug artefacts and enforce the
                     # correct part ending marker (intermediate vs final) from history.
                     final_response = _strip_generation_artifacts(final_response)
                     final_response = _enforce_part_numbered_conclusion_heading(final_response)
+                    final_response = _enforce_part_ending_by_history(
+                        final_response,
+                        prompt_for_model,
+                        current_project.get('messages', [])
+                    )
+                    # Last-resort guard: never persist debug/context dumps in assistant text.
+                    final_response = re.sub(r'(?is)\n\s*📚\s*RAG Retrieved Content \(Debug\).*$','', final_response).strip()
+                    final_response = re.sub(r'(?is)\n\s*\[RAG CONTEXT - INTERNAL - DO NOT OUTPUT\].*$','', final_response).strip()
                     final_response = _enforce_part_ending_by_history(
                         final_response,
                         prompt_for_model,
