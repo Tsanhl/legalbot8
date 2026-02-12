@@ -30,7 +30,9 @@ Set these environment variables in Render:
 - `RAG_HF_REPO_ID=Agnes999/legalbot8`
 - `RAG_HF_REPO_TYPE=dataset`
 - `RAG_GOOGLE_GROUNDING_FALLBACK=1` (enable retrieve-first, Google fallback)
-- `RAG_GROUNDING_MIN_CHARS=15000` (fallback trigger when retrieval is thin)
+- `RAG_GROUNDING_MIN_CHARS=8000` (fallback trigger when retrieval is thin)
+- `RAG_GROUNDING_PROACTIVE=0` (keep fallback strict; set `1` to proactively web-ground recency prompts)
+- `RAG_ANY_TOPIC_MAX_CHUNKS=10` (faster retrieval for underspecified "any topic" essays)
 - `HF_TOKEN=<your_huggingface_token>` (required only if dataset is private)
 
 # legal-doc

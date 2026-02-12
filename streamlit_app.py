@@ -260,6 +260,21 @@ def _strip_generation_artifacts(text: str) -> str:
     t = (text or "")
     if not t.strip():
         return t
+    # If debug content leaked after an "(End of Answer)" marker, keep only the answer body.
+    end_marker = re.search(r"\(End of Answer\)", t, flags=re.IGNORECASE)
+    if end_marker:
+        tail = t[end_marker.end():]
+        tail_lower = tail.lower()
+        if any(m in tail_lower for m in [
+            "rag retrieved content (debug)",
+            "context length:",
+            "allowed authorities (preview):",
+            "[rag context - internal - do not output]",
+            "removed 1 non-retrieved authority mention",
+            "removed 2 non-retrieved authority mention",
+            "removed 3 non-retrieved authority mention",
+        ]):
+            t = t[:end_marker.start()].rstrip()
     # Hard-cut when known debug headers leak into answer body.
     cut_markers = [
         "📚 RAG Retrieved Content (Debug)",
@@ -485,20 +500,46 @@ def _has_visible_conclusion(answer_text: str) -> bool:
     ):
         return True
 
-    # Check the tail region where conclusions should appear.
-    tail_start = max(0, int(len(body) * 0.60))
-    # Also include a fixed-size trailing window for short/uneven layouts.
-    tail = (body[tail_start:] + "\n" + body[max(0, len(body) - 2200):]).lower()
+    # Check only the trailing region where conclusions should appear.
+    # Using a tighter tail avoids false-positives from mid-body words like "overall".
+    tail = body[max(0, len(body) - 1200):].lower()
+    paragraphs = [p.strip().lower() for p in re.split(r"\n\s*\n", body) if p.strip()]
+    last_para = paragraphs[-1] if paragraphs else tail
     patterns = [
         r"\bconclusion\b",
         r"\bin conclusion\b",
+        r"\bto conclude\b",
         r"\bfinal outcome\b",
         r"\bfinal advice\b",
         r"\badvice to\b",
         r"\bin summary\b",
-        r"\boverall\b",
+        r"\bon balance\b",
     ]
-    return any(re.search(p, tail) for p in patterns)
+    return any(re.search(p, last_para) or re.search(p, tail) for p in patterns)
+
+def _needs_forced_part_conclusion(answer_text: str) -> bool:
+    """
+    Detect structured Part I/II/... answers that never include an explicit
+    conclusion/advice heading. These should receive an auto-appended final part.
+    """
+    text = (answer_text or "").strip()
+    if not text:
+        return False
+    body = re.sub(r"\(End of Answer\)\s*$", "", text, flags=re.IGNORECASE).strip()
+    body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
+    if not body:
+        return False
+
+    part_titles = re.findall(r"(?im)^\s*Part\s+([IVXLC]+)\s*:\s*(.+)$", body)
+    # Require at least two parts to avoid forcing structure onto non-part answers.
+    if len(part_titles) < 2:
+        return False
+
+    for _roman, title in part_titles:
+        t = (title or "").strip()
+        if re.search(r"(?i)\b(conclusion|advice)\b", t):
+            return False
+    return True
 
 def _resolve_word_window_from_history(prompt_text: str, messages: List[Dict[str, Any]]) -> Optional[tuple]:
     """
@@ -2390,7 +2431,12 @@ def main():
                                 # Allow a larger first patch so truncated final parts can actually finish.
                                 max_patch_words_cap = 420
                                 min_patch_words_floor = 60
-                                for _ in range(2):
+                                try:
+                                    abrupt_patch_attempts = int(os.getenv("ABRUPT_COMPLETION_PATCH_ATTEMPTS", "1"))
+                                except ValueError:
+                                    abrupt_patch_attempts = 1
+                                abrupt_patch_attempts = max(0, min(abrupt_patch_attempts, 2))
+                                for _ in range(abrupt_patch_attempts):
                                     if not _is_abrupt_answer_ending(final_response):
                                         break
                                     max_patch_words_now = max_patch_words_cap
@@ -2484,7 +2530,10 @@ def main():
 
                     # Final-part safety net: ensure a visible conclusion block exists even when
                     # the model spends budget on earlier analysis. Keep within current word cap.
-                    if (not is_intermediate_part) and (not _has_visible_conclusion(final_response)):
+                    if (
+                        (not is_intermediate_part)
+                        and ((not _has_visible_conclusion(final_response)) or _needs_forced_part_conclusion(final_response))
+                    ):
                         heading = _next_part_conclusion_heading(final_response)
                         fallback = (
                             f"{heading}\n\n"

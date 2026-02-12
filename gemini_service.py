@@ -482,6 +482,14 @@ def get_dynamic_chunk_count(message: str, history: List[dict] = None) -> int:
     target = _requested_word_target(message)
     if target is not None and target <= 800:
         chunk_count = min(chunk_count, 8)
+    elif target is not None and target <= 1200:
+        chunk_count = min(chunk_count, 12)
+
+    # "Any topic" essay prompts are intentionally underspecified; keep retrieval light
+    # to reduce latency/noise while still grounding core legal content.
+    msg_lower = (message or "").lower()
+    if ("essay" in msg_lower) and any(k in msg_lower for k in ["any topic", "any subject", "any area"]):
+        chunk_count = min(chunk_count, 10)
     
     # Enhanced logging for combined questions
     if len(all_types) > 1:
@@ -530,6 +538,10 @@ def _estimate_max_output_tokens(target_words: Optional[int]) -> int:
     """
     if not target_words or target_words <= 0:
         return 8192
+    if target_words <= 1200:
+        # Small essays can still require ample tokens due to OSCOLA citations and headings.
+        buffered = int(target_words * 3.0) + 1024
+        return max(2048, min(16384, buffered))
     # ~2.2–2.6 tokens/word is a safe envelope for legal prose with citations.
     buffered = int(target_words * 2.6) + 768
     return max(1024, min(16384, buffered))
@@ -4300,38 +4312,29 @@ def should_use_google_search_grounding(message: str, rag_context: Optional[str] 
         'reason': None,
         'enforce_oscola': True  # Always enforce OSCOLA for academic integrity
     }
-    
-    # Indicators that Google Search would be beneficial
-    google_search_indicators = [
+
+    # Optional proactive mode: when enabled, explicit recency/external-source cues can
+    # trigger grounding even if retrieval is not thin. Default OFF to keep latency low.
+    proactive_flag = os.getenv("RAG_GROUNDING_PROACTIVE", "0").strip().lower()
+    proactive_enabled = proactive_flag in {"1", "true", "yes", "on"}
+
+    # Indicators that strongly justify external grounding.
+    proactive_indicators = [
         # Recent/current events
         '2025', '2026', 'recent', 'latest', 'current', 'new law', 'new case',
         'recent case', 'recent statute', 'recent decision', 'recent judgment',
-        
-        # Complex/specialized topics that may need additional sources
-        'critically discuss', 'critically analyse', 'critically analyze',
-        'evaluate', 'assess', 'to what extent',
-        
-        # Explicit requests for additional sources
+        # Explicit requests for external material
         'additional sources', 'more sources', 'external sources',
         'journal articles', 'academic sources', 'scholarly sources',
-        'case law', 'recent cases', 'recent legislation',
-        
-        # Essay indicators (essays often need multiple sources)
-        'essay', 'dissertation', 'extended essay', 'long essay',
-        '2000 word', '3000 word', '4000 word', '5000 word',
-        
-        # Specific legal areas that may need current updates
-        'human rights', 'data protection', 'artificial intelligence',
-        'cryptocurrency', 'climate change', 'pandemic', 'covid',
-        'brexit', 'european union', 'eu law'
+        'google', 'web search', 'search online', 'search the web'
     ]
     
     # Check if RAG context seems insufficient (too short, empty, or error marker)
     rag_insufficient = False
     try:
-        min_chars = int(os.getenv("RAG_GROUNDING_MIN_CHARS", "15000"))
+        min_chars = int(os.getenv("RAG_GROUNDING_MIN_CHARS", "8000"))
     except ValueError:
-        min_chars = 15000
+        min_chars = 8000
     rag_text = (rag_context or "").strip()
     if (
         (not rag_text)
@@ -4342,17 +4345,18 @@ def should_use_google_search_grounding(message: str, rag_context: Optional[str] 
         rag_insufficient = True
         result['reason'] = f'RAG context insufficient (<{min_chars} chars or unavailable)'
     
-    # Check for Google Search indicators
-    for indicator in google_search_indicators:
+    matched_indicator = None
+    for indicator in proactive_indicators:
         if indicator in msg_lower:
-            result['use_google_search'] = True
-            if not result['reason']:
-                result['reason'] = f'Detected indicator: {indicator}'
+            matched_indicator = indicator
             break
-    
-    # If RAG is insufficient, always use Google Search
+
+    # Strict fallback by default: use grounding when RAG is thin/unavailable.
     if rag_insufficient:
         result['use_google_search'] = True
+    elif proactive_enabled and matched_indicator:
+        result['use_google_search'] = True
+        result['reason'] = f'Detected indicator: {matched_indicator}'
     
     if result['use_google_search']:
         print(f"[GOOGLE SEARCH] Enabled - Reason: {result['reason']}")
@@ -4552,6 +4556,7 @@ def send_message_with_docs(
         'reason': None,
         'enforce_oscola': True
     }
+    is_any_topic_fastpath = False
     query_type = "general"
     max_chunks_total = 20
     requested_wc_for_citations = _extract_requested_word_count(message)
@@ -4566,6 +4571,7 @@ def send_message_with_docs(
     if _is_any_topic_essay_prompt(message):
         message = _rewrite_any_topic_prompt(message)
         history_for_model = []  # start fresh: no history bleed for underspecified prompts
+        is_any_topic_fastpath = True
 
     # RAG: Retrieve relevant content from indexed documents with DYNAMIC chunk count
     if RAG_AVAILABLE:
@@ -4630,6 +4636,12 @@ def send_message_with_docs(
             # Detect query type and get optimal chunk count
             query_type = detect_query_type(rag_query, history)
             max_chunks_total = get_dynamic_chunk_count(rag_query, history)
+            if is_any_topic_fastpath:
+                try:
+                    fast_cap = int(os.getenv("RAG_ANY_TOPIC_MAX_CHUNKS", "10"))
+                except ValueError:
+                    fast_cap = 10
+                max_chunks_total = min(max_chunks_total, max(4, fast_cap))
 
             # Topic-aware query-type override:
             # Some “problem questions” are applications of theory (e.g., jurisprudence) and
@@ -4854,7 +4866,7 @@ def send_message_with_docs(
             # automatically run one strict re-query and keep the stronger context.
             if rag_context and isinstance(rag_context, str) and not rag_context.startswith("[RAG]") and not rag_context.startswith("[RAG ERROR]"):
                 retrieval_audit = _rag_quality_audit(rag_context, retrieval_profile)
-                if _is_legal_query_text(rag_query) and retrieval_audit.get("needs_retry"):
+                if (not is_any_topic_fastpath) and _is_legal_query_text(rag_query) and retrieval_audit.get("needs_retry"):
                     strict_query = _build_strict_requery(rag_query, retrieval_profile, retrieval_audit)
                     strict_type = detect_query_type(strict_query, history)
                     strict_type = _effective_query_type(strict_type)
