@@ -546,6 +546,56 @@ def _needs_forced_part_conclusion(answer_text: str) -> bool:
             return False
     return True
 
+def _is_short_single_essay(prompt_text: str, messages: List[Dict[str, Any]]) -> bool:
+    """
+    True when this is a single-response essay request with an explicit
+    word target of <= 2000 words.
+    """
+    targets = _extract_word_targets(prompt_text or "")
+    if len(targets) != 1:
+        return False
+    if int(targets[0]) > 2000:
+        return False
+    if _expected_part_state_from_history(prompt_text, messages):
+        return False
+    return bool(re.search(r"\bessay\b", (prompt_text or ""), flags=re.IGNORECASE))
+
+def _strip_leaked_debug_payload(text: str) -> str:
+    """
+    Remove any leaked debug/context payload from assistant text.
+    """
+    t = (text or "")
+    if not t.strip():
+        return t
+    cut_markers = [
+        "📚 RAG Retrieved Content (Debug)",
+        "[RAG CONTEXT - INTERNAL - DO NOT OUTPUT]",
+        "Allowed Authorities (preview):",
+        "Context Length:",
+        "[SOURCE 1]",
+    ]
+    cut_pos = None
+    for m in cut_markers:
+        idx = t.find(m)
+        if idx >= 0:
+            cut_pos = idx if cut_pos is None else min(cut_pos, idx)
+    if cut_pos is not None:
+        t = t[:cut_pos]
+    return t.rstrip()
+
+def _truncate_restarted_part_i(text: str) -> str:
+    """
+    If output restarts unexpectedly with another "Part I: ..." block, keep only
+    content before that second restart.
+    """
+    t = (text or "")
+    if not t.strip():
+        return t
+    matches = list(re.finditer(r"(?im)^\s*Part\s+I\s*:\s*.+$", t))
+    if len(matches) >= 2:
+        t = t[:matches[1].start()].rstrip()
+    return t
+
 def _inject_brief_conclusion_tail(answer_text: str, max_words: Optional[int] = None) -> str:
     """
     Ensure a final explicit conclusion block exists, while respecting an optional
@@ -2282,9 +2332,14 @@ def main():
                     # Add assistant message with grounding data
                     # If stopped, add indicator to the response
                     final_response = full_response
+                    project_messages = current_project.get('messages', [])
                     expected_part_state = _expected_part_state_from_history(
                         prompt_for_model,
-                        current_project.get('messages', [])
+                        project_messages
+                    )
+                    is_short_single_essay = _is_short_single_essay(
+                        prompt_for_model,
+                        project_messages
                     )
                     is_intermediate_part = bool(
                         expected_part_state and not expected_part_state.get("is_final")
@@ -2300,7 +2355,7 @@ def main():
                         # Optional second-pass tightening for explicit word-count prompts (slow; OFF by default)
                         fix_instruction = _needs_wordcount_fix(prompt_for_model, final_response) if (st.session_state.enable_wordcount_adjust and not is_intermediate_part) else None
                         if st.session_state.enable_wordcount_adjust and (not is_intermediate_part) and not fix_instruction:
-                            history_window = _resolve_word_window_from_history(prompt_for_model, current_project.get('messages', []))
+                            history_window = _resolve_word_window_from_history(prompt_for_model, project_messages)
                             if history_window:
                                 min_w, max_w = history_window
                                 actual_w = _count_words(final_response)
@@ -2422,7 +2477,7 @@ def main():
                             final_response = sanitized
 
                         # Hard cap safety net for strict 99-100% part planning windows.
-                        history_window = _resolve_word_window_from_history(prompt_for_model, current_project.get('messages', []))
+                        history_window = _resolve_word_window_from_history(prompt_for_model, project_messages)
                         if history_window:
                             min_w, max_w = history_window
                             final_response = _truncate_to_word_cap(final_response, max_w, min_w)
@@ -2464,23 +2519,17 @@ def main():
                         if (not was_stopped) and _is_abrupt_answer_ending(final_response):
                             try:
                                 history_window_now = _resolve_word_window_from_history(
-                                    prompt_for_model, current_project.get('messages', [])
+                                    prompt_for_model, project_messages
                                 )
                                 # Allow a larger first patch so truncated final parts can actually finish.
                                 max_patch_words_cap = 420
                                 min_patch_words_floor = 60
-                                targets_now = _extract_word_targets(prompt_for_model)
-                                is_short_single_response = (
-                                    len(targets_now) == 1
-                                    and int(targets_now[0]) <= 1200
-                                    and (not _expected_part_state_from_history(prompt_for_model, current_project.get('messages', [])))
-                                )
                                 try:
                                     abrupt_patch_attempts = int(
-                                        os.getenv("ABRUPT_COMPLETION_PATCH_ATTEMPTS", "0" if is_short_single_response else "1")
+                                        os.getenv("ABRUPT_COMPLETION_PATCH_ATTEMPTS", "0" if is_short_single_essay else "1")
                                     )
                                 except ValueError:
-                                    abrupt_patch_attempts = 0 if is_short_single_response else 1
+                                    abrupt_patch_attempts = 0 if is_short_single_essay else 1
                                 abrupt_patch_attempts = max(0, min(abrupt_patch_attempts, 2))
                                 for _ in range(abrupt_patch_attempts):
                                     if not _is_abrupt_answer_ending(final_response):
@@ -2580,12 +2629,17 @@ def main():
                     single_target_words = None
                     try:
                         targets = _extract_word_targets(prompt_for_model)
-                        if len(targets) == 1 and not _expected_part_state_from_history(prompt_for_model, current_project.get('messages', [])):
+                        if len(targets) == 1 and not _expected_part_state_from_history(prompt_for_model, project_messages):
                             single_target_words = int(targets[0])
                             min_w = int(single_target_words * 0.99)
                             final_response = _truncate_to_word_cap(final_response, single_target_words, min_w)
                     except Exception as cap_e:
                         print(f"Word-cap enforcement skipped due to error: {cap_e}")
+
+                    # Short-essay hardening: keep only the first essay block and strip any leaked debug.
+                    if is_short_single_essay:
+                        final_response = _strip_leaked_debug_payload(final_response)
+                        final_response = _truncate_restarted_part_i(final_response)
 
                     # Final-part safety net: ensure a visible conclusion block exists.
                     if (
@@ -2606,11 +2660,14 @@ def main():
                     # Final hardening: clean any leaked debug artefacts and enforce the
                     # correct part ending marker (intermediate vs final) from history.
                     final_response = _strip_generation_artifacts(final_response)
+                    final_response = _strip_leaked_debug_payload(final_response)
+                    if is_short_single_essay:
+                        final_response = _truncate_restarted_part_i(final_response)
                     final_response = _enforce_part_numbered_conclusion_heading(final_response)
                     final_response = _enforce_part_ending_by_history(
                         final_response,
                         prompt_for_model,
-                        current_project.get('messages', [])
+                        project_messages
                     )
                     # Last-resort guard: never persist debug/context dumps in assistant text.
                     final_response = re.sub(r'(?is)\n\s*📚\s*RAG Retrieved Content \(Debug\).*$','', final_response).strip()
@@ -2618,7 +2675,7 @@ def main():
                     final_response = _enforce_part_ending_by_history(
                         final_response,
                         prompt_for_model,
-                        current_project.get('messages', [])
+                        project_messages
                     )
                     status_placeholder.empty()
                     
