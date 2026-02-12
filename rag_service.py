@@ -652,6 +652,10 @@ class RAGService:
         self.persist_directory = persist_directory
         self.use_upgraded_embeddings = use_upgraded_embeddings
 
+        # Optional startup bootstrap for cloud deployments:
+        # If local ChromaDB files are missing, fetch them from Hugging Face dataset storage.
+        self._bootstrap_chroma_from_hf(self.persist_directory)
+
         # ChromaDB persistence migration (compatibility):
         # Some older/newer Chroma builds stored `index_metadata.pickle` as a dict.
         # Newer versions expect a `PersistentData` object, otherwise queries crash with:
@@ -711,6 +715,80 @@ class RAGService:
         self.bm25_chunk_ids: List[str] = []  # Maps BM25 index to chunk ID
 
         print(f"📚 RAG Service initialized with {self.collection.count()} chunks")
+
+    def _has_local_chroma_data(self, persist_directory: str) -> bool:
+        """Return True when the persisted ChromaDB structure appears usable."""
+        sqlite_path = os.path.join(persist_directory, "chroma.sqlite3")
+        try:
+            if not os.path.exists(sqlite_path) or os.path.getsize(sqlite_path) == 0:
+                return False
+        except OSError:
+            return False
+
+        for root, _dirs, files in os.walk(persist_directory):
+            if "index_metadata.pickle" in files:
+                return True
+        return False
+
+    def _bootstrap_chroma_from_hf(self, persist_directory: str) -> None:
+        """
+        Bootstrap local ChromaDB from Hugging Face dataset storage when missing.
+
+        Env vars:
+            RAG_HF_BOOTSTRAP: Enable/disable startup download (default: 1)
+            RAG_HF_REPO_ID: HF dataset repo id (default: Agnes999/legalbot8)
+            RAG_HF_REPO_TYPE: HF repo type (default: dataset)
+            HF_TOKEN / HUGGINGFACEHUB_API_TOKEN: optional token for private repos
+        """
+        if self._has_local_chroma_data(persist_directory):
+            return
+
+        bootstrap_flag = os.getenv("RAG_HF_BOOTSTRAP", "1").strip().lower()
+        if bootstrap_flag in {"0", "false", "no", "off"}:
+            print("ℹ️ RAG_HF_BOOTSTRAP is disabled and local ChromaDB is missing.")
+            return
+
+        repo_id = os.getenv("RAG_HF_REPO_ID", "Agnes999/legalbot8").strip()
+        repo_type = os.getenv("RAG_HF_REPO_TYPE", "dataset").strip() or "dataset"
+        if not repo_id:
+            print("⚠️ RAG_HF_REPO_ID is empty; skipping ChromaDB bootstrap.")
+            return
+
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception:
+            print("⚠️ huggingface_hub not installed; cannot bootstrap ChromaDB from HF.")
+            return
+
+        os.makedirs(persist_directory, exist_ok=True)
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        print(f"☁️ Local ChromaDB missing. Downloading from HF {repo_type}:{repo_id} ...")
+
+        try:
+            try:
+                snapshot_download(
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    local_dir=persist_directory,
+                    token=token,
+                    resume_download=True,
+                )
+            except TypeError:
+                # Compatibility with huggingface_hub versions that don't accept resume_download.
+                snapshot_download(
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    local_dir=persist_directory,
+                    token=token,
+                )
+        except Exception as e:
+            print(f"⚠️ Failed to bootstrap ChromaDB from HF ({repo_id}): {e}")
+            return
+
+        if self._has_local_chroma_data(persist_directory):
+            print("✅ ChromaDB bootstrap complete.")
+        else:
+            print("⚠️ HF bootstrap finished but ChromaDB files still look incomplete.")
 
     def _migrate_legacy_index_metadata(self, persist_directory: str) -> None:
         """
