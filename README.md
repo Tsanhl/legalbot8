@@ -29,6 +29,8 @@ Set these environment variables in Render:
 - `RAG_HF_BOOTSTRAP=1`
 - `RAG_HF_REPO_ID=Agnes999/legalbot8`
 - `RAG_HF_REPO_TYPE=dataset`
+- `RAG_GOOGLE_GROUNDING_FALLBACK=1` (enable retrieve-first, Google fallback)
+- `RAG_GROUNDING_MIN_CHARS=15000` (fallback trigger when retrieval is thin)
 - `HF_TOKEN=<your_huggingface_token>` (required only if dataset is private)
 
 # legal-doc

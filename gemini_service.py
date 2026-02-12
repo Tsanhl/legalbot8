@@ -2477,6 +2477,8 @@ def strip_internal_reasoning(text: str) -> str:
     text = re.sub(r'\(([^()]{35,200})\)', _is_raw_title_citation, text)
 
     # Clean up excessive blank lines left by removals
+    # Remove raw tool-call style markup if the model ever leaks it into output text.
+    text = re.sub(r'(?is)\b(?:google_search|search_web|web_search)\s*\{.*?\}', '', text)
     text = re.sub(r'\n{4,}', '\n\n\n', text)
 
     return text.strip()
@@ -4283,6 +4285,15 @@ def should_use_google_search_grounding(message: str, rag_context: Optional[str] 
         - 'enforce_oscola': bool - whether to enforce OSCOLA citations for Google sources
     """
     msg_lower = message.lower()
+
+    # Global kill switch for fallback grounding if needed in production.
+    fallback_flag = os.getenv("RAG_GOOGLE_GROUNDING_FALLBACK", "1").strip().lower()
+    if fallback_flag in {"0", "false", "no", "off"}:
+        return {
+            'use_google_search': False,
+            'reason': 'Fallback disabled by RAG_GOOGLE_GROUNDING_FALLBACK',
+            'enforce_oscola': True
+        }
     
     result = {
         'use_google_search': False,
@@ -4315,11 +4326,21 @@ def should_use_google_search_grounding(message: str, rag_context: Optional[str] 
         'brexit', 'european union', 'eu law'
     ]
     
-    # Check if RAG context seems insufficient (too short or empty)
+    # Check if RAG context seems insufficient (too short, empty, or error marker)
     rag_insufficient = False
-    if rag_context is None or len(rag_context.strip()) < 500:
+    try:
+        min_chars = int(os.getenv("RAG_GROUNDING_MIN_CHARS", "15000"))
+    except ValueError:
+        min_chars = 15000
+    rag_text = (rag_context or "").strip()
+    if (
+        (not rag_text)
+        or rag_text.startswith("[RAG]")
+        or rag_text.startswith("[RAG ERROR]")
+        or len(rag_text) < min_chars
+    ):
         rag_insufficient = True
-        result['reason'] = 'RAG context insufficient'
+        result['reason'] = f'RAG context insufficient (<{min_chars} chars or unavailable)'
     
     # Check for Google Search indicators
     for indicator in google_search_indicators:
@@ -4525,6 +4546,12 @@ def send_message_with_docs(
     # Build content parts
     parts = []
     rag_context = None  # Store RAG context for debugging
+    rag_query_for_grounding = message
+    google_grounding_decision: Dict[str, Any] = {
+        'use_google_search': False,
+        'reason': None,
+        'enforce_oscola': True
+    }
     query_type = "general"
     max_chunks_total = 20
     requested_wc_for_citations = _extract_requested_word_count(message)
@@ -4598,6 +4625,7 @@ def send_message_with_docs(
             retrieval_profile = _infer_retrieval_profile(rag_query)
 
             rag_query = _truncate_for_rag_query(rag_query)
+            rag_query_for_grounding = rag_query
 
             # Detect query type and get optimal chunk count
             query_type = detect_query_type(rag_query, history)
@@ -4857,7 +4885,7 @@ def send_message_with_docs(
             print(f"RAG retrieval warning: {e}")
             # Keep a visible debug string for the UI (but do not add to LLM prompt)
             rag_context = f"[RAG ERROR] {type(e).__name__}: {e}"
-    
+
     # THIN CONTEXT WARNING: keep analysis calibrated when retrieval is sparse.
     if rag_context and isinstance(rag_context, str) and not rag_context.startswith("[RAG]") and not rag_context.startswith("[RAG ERROR]"):
         rag_char_count = len(rag_context)
@@ -4875,6 +4903,22 @@ This means your retrieved sources are THIN. You MUST:
 """
             parts.append(thin_warning)
             print(f"[THIN CONTEXT] Only {rag_char_count} chars retrieved — thin context warning added")
+
+    # Enable Google grounding only as a fallback when retrieval quality is insufficient.
+    if _is_legal_query_text(rag_query_for_grounding):
+        google_grounding_decision = should_use_google_search_grounding(
+            rag_query_for_grounding,
+            rag_context if isinstance(rag_context, str) else None
+        )
+        if google_grounding_decision.get('use_google_search'):
+            parts.append(
+                "[GOOGLE GROUNDING FALLBACK MODE]\n"
+                "Priority order: (1) Use retrieved RAG authorities first. "
+                "(2) Use Google-grounded sources only to fill gaps or recent updates.\n"
+                "Do not contradict retrieved primary authorities unless newer authoritative sources clearly require it.\n"
+                "Cite all non-RAG authorities in OSCOLA format."
+            )
+            print(f"[GOOGLE SEARCH] Fallback enabled: {google_grounding_decision.get('reason')}")
 
     # Add document context if any
     if documents:
@@ -7535,18 +7579,20 @@ Cumulative target: Part 1-{current_part} should total ~{words_per_part * current
         if knowledge_base_loaded and knowledge_base_summary:
             full_system_instruction += "\n\n" + knowledge_base_summary
         
-        # Configure Google Search grounding tool
-        # DISABLED: Causes empty G icons and raw markup bugs
-        # grounding_tool = types.Tool(
-        #     google_search=types.GoogleSearch()
-        # )
-        
         max_out = _estimate_max_output_tokens(response_word_budget)
-        config = types.GenerateContentConfig(
-            system_instruction=full_system_instruction,
-            max_output_tokens=max_out,
-            # tools=[grounding_tool]
-        )
+        config_kwargs: Dict[str, Any] = {
+            "system_instruction": full_system_instruction,
+            "max_output_tokens": max_out,
+        }
+
+        if google_grounding_decision.get('use_google_search'):
+            try:
+                grounding_tool = types.Tool(google_search=types.GoogleSearch())
+                config_kwargs["tools"] = [grounding_tool]
+            except Exception as tool_err:
+                print(f"[GOOGLE SEARCH] Could not enable grounding tool: {tool_err}")
+
+        config = types.GenerateContentConfig(**config_kwargs)
         
         # Build contents with (optionally trimmed) history
         contents = []
